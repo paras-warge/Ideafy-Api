@@ -115,9 +115,12 @@ def process_info(info: dict, original_url: str) -> dict:
     audio_added = False
 
     video_formats = [
-        f for f in formats_raw
-        if f.get("vcodec") != "none" and f.get("url") and f.get("height")
-    ]
+    f for f in formats_raw
+    if f.get("vcodec") != "none"
+    and f.get("acodec") != "none"   # ✅ ensures audio present
+    and f.get("url")
+    and f.get("height")
+]
     audio_formats = [
         f for f in formats_raw
         if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url")
