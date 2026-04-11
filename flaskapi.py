@@ -9,7 +9,6 @@ from cachetools import TTLCache
 app = Flask(__name__)
 CORS(app)
 
-# Cache with TTL of 5 minutes, max 200 entries
 cache = TTLCache(maxsize=200, ttl=300)
 
 PLATFORM_PATTERNS = {
@@ -30,8 +29,10 @@ PLATFORM_PATTERNS = {
 
 SUPPORTED_PLATFORMS = ["youtube", "facebook", "instagram", "twitter"]
 
-# Absolute path to cookies.txt
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
+
+# Read proxy from environment variable
+PROXY_URL = os.environ.get("PROXY_URL", None)
 
 def detect_platform(url: str) -> str:
     url_lower = url.lower()
@@ -83,8 +84,6 @@ def extract_video_info(url: str):
         return cache[cache_key]
 
     platform = detect_platform(url)
-
-    # Use cookies only for YouTube
     use_cookies = platform == "youtube" and os.path.exists(COOKIES_PATH)
 
     ydl_opts = {
@@ -108,9 +107,13 @@ def extract_video_info(url: str):
         },
     }
 
-    # Add cookies only for YouTube
+    # Add cookies for YouTube
     if use_cookies:
         ydl_opts["cookiefile"] = COOKIES_PATH
+
+    # Add proxy if available
+    if PROXY_URL:
+        ydl_opts["proxy"] = PROXY_URL
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -133,7 +136,6 @@ def process_info(info: dict, original_url: str) -> dict:
     seen_keys = set()
     audio_added = False
 
-    # Video formats — must have both video and audio codec
     video_formats = [
         f for f in formats_raw
         if f.get("vcodec") not in [None, "none"]
@@ -141,7 +143,6 @@ def process_info(info: dict, original_url: str) -> dict:
         and f.get("height")
     ]
 
-    # Audio only formats
     audio_formats = [
         f for f in formats_raw
         if f.get("vcodec") in [None, "none"]
@@ -149,7 +150,6 @@ def process_info(info: dict, original_url: str) -> dict:
         and f.get("url")
     ]
 
-    # Sort by height descending
     video_formats.sort(key=lambda f: (f.get("height", 0), f.get("fps", 0) or 0), reverse=True)
     audio_formats.sort(key=lambda f: f.get("tbr", 0) or 0, reverse=True)
 
@@ -163,7 +163,6 @@ def process_info(info: dict, original_url: str) -> dict:
         quality_label = get_quality_label(height)
         is_60fps = fps >= 50
 
-        # Deduplicate by quality + fps combo
         key = f"{quality_label}_{'60fps' if is_60fps else '30fps'}"
         if key in seen_keys:
             continue
@@ -197,7 +196,6 @@ def process_info(info: dict, original_url: str) -> dict:
             "has_audio": fmt.get("acodec") not in [None, "none"],
         })
 
-    # Add best audio only option
     if audio_formats and not audio_added:
         best_audio = audio_formats[0]
         download_url = best_audio.get("url")
@@ -223,7 +221,6 @@ def process_info(info: dict, original_url: str) -> dict:
             })
             audio_added = True
 
-    # Fallback — use best single format if nothing found
     if not formats:
         best_url = info.get("url")
         if best_url:
@@ -328,7 +325,8 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "video-downloader-api",
-        "supported_platforms": SUPPORTED_PLATFORMS
+        "supported_platforms": SUPPORTED_PLATFORMS,
+        "proxy_enabled": PROXY_URL is not None,
     })
 
 if __name__ == "__main__":
