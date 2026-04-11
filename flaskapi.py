@@ -85,7 +85,8 @@ def extract_video_info(url: str):
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "format": "bestvideo+bestaudio/best",
+        "format": "bestvideo+bestaudio/best",    
+        "cookiefile": "cookies.txt",
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         },
@@ -117,7 +118,7 @@ def process_info(info: dict, original_url: str) -> dict:
     video_formats = [
     f for f in formats_raw
     if f.get("vcodec") != "none"
-    and f.get("acodec") != "none"   # ✅ ensures audio present
+    and f.get("acodec") != "none"   
     and f.get("url")
     and f.get("height")
 ]
