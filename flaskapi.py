@@ -1,7 +1,5 @@
 import os
 import re
-import json
-import time
 import hashlib
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -32,6 +30,9 @@ PLATFORM_PATTERNS = {
 
 SUPPORTED_PLATFORMS = ["youtube", "facebook", "instagram", "twitter"]
 
+# Absolute path to cookies.txt
+COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
+
 def detect_platform(url: str) -> str:
     url_lower = url.lower()
     for platform, patterns in PLATFORM_PATTERNS.items():
@@ -51,7 +52,7 @@ def format_duration(seconds) -> str:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
 
-def estimate_file_size(tbr, duration) -> int | None:
+def estimate_file_size(tbr, duration):
     if tbr and duration:
         return int((tbr * 1000 / 8) * duration)
     return None
@@ -81,18 +82,35 @@ def extract_video_info(url: str):
     if cache_key in cache:
         return cache[cache_key]
 
+    platform = detect_platform(url)
+
+    # Use cookies only for YouTube
+    use_cookies = platform == "youtube" and os.path.exists(COOKIES_PATH)
+
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "format": "best/bestvideo+bestaudio",    
-        "cookiefile": "cookies.txt",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        },
+        "format": "best/bestvideo+bestaudio",
         "socket_timeout": 30,
-        "extractor_retries": 2,
+        "extractor_retries": 3,
+        "nocheckcertificate": True,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
     }
+
+    # Add cookies only for YouTube
+    if use_cookies:
+        ydl_opts["cookiefile"] = COOKIES_PATH
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -112,22 +130,27 @@ def process_info(info: dict, original_url: str) -> dict:
 
     formats_raw = info.get("formats") or []
     formats = []
-    seen_heights = set()
+    seen_keys = set()
     audio_added = False
 
+    # Video formats — must have both video and audio codec
     video_formats = [
-    f for f in formats_raw
-    if f.get("vcodec") != "none"
-    and f.get("acodec") != "none"   
-    and f.get("url")
-    and f.get("height")
-]
-    audio_formats = [
         f for f in formats_raw
-        if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url")
+        if f.get("vcodec") not in [None, "none"]
+        and f.get("url")
+        and f.get("height")
     ]
 
-    video_formats.sort(key=lambda f: f.get("height", 0), reverse=True)
+    # Audio only formats
+    audio_formats = [
+        f for f in formats_raw
+        if f.get("vcodec") in [None, "none"]
+        and f.get("acodec") not in [None, "none"]
+        and f.get("url")
+    ]
+
+    # Sort by height descending
+    video_formats.sort(key=lambda f: (f.get("height", 0), f.get("fps", 0) or 0), reverse=True)
     audio_formats.sort(key=lambda f: f.get("tbr", 0) or 0, reverse=True)
 
     for fmt in video_formats:
@@ -135,13 +158,16 @@ def process_info(info: dict, original_url: str) -> dict:
         if not height:
             continue
 
+        fps = fmt.get("fps") or 0
         ext = fmt.get("ext") or "mp4"
         quality_label = get_quality_label(height)
+        is_60fps = fps >= 50
 
-        key = f"{quality_label}_{ext}"
-        if key in seen_heights:
+        # Deduplicate by quality + fps combo
+        key = f"{quality_label}_{'60fps' if is_60fps else '30fps'}"
+        if key in seen_keys:
             continue
-        seen_heights.add(key)
+        seen_keys.add(key)
 
         download_url = fmt.get("url") or fmt.get("manifest_url")
         if not download_url:
@@ -154,14 +180,14 @@ def process_info(info: dict, original_url: str) -> dict:
         elif fmt.get("filesize_approx"):
             file_size = fmt.get("filesize_approx")
 
-        recommended = quality_label == "720p"
+        recommended = quality_label == "720p" and not is_60fps
 
         formats.append({
             "format_id": fmt.get("format_id"),
             "quality": quality_label,
             "ext": ext if ext != "none" else "mp4",
             "resolution": f"{fmt.get('width', '?')}x{height}",
-            "fps": fmt.get("fps"),
+            "fps": fps,
             "vcodec": fmt.get("vcodec"),
             "acodec": fmt.get("acodec"),
             "file_size": file_size,
@@ -171,7 +197,7 @@ def process_info(info: dict, original_url: str) -> dict:
             "has_audio": fmt.get("acodec") not in [None, "none"],
         })
 
-    # Add audio-only MP3 option
+    # Add best audio only option
     if audio_formats and not audio_added:
         best_audio = audio_formats[0]
         download_url = best_audio.get("url")
@@ -197,7 +223,7 @@ def process_info(info: dict, original_url: str) -> dict:
             })
             audio_added = True
 
-    # If no separate formats found, use best merged format
+    # Fallback — use best single format if nothing found
     if not formats:
         best_url = info.get("url")
         if best_url:
@@ -246,7 +272,6 @@ def get_video_info():
 
     platform = detect_platform(url)
 
-    # Block unsupported platforms
     if platform == "unknown":
         return jsonify({
             "success": False,
