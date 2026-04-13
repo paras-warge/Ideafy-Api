@@ -30,9 +30,8 @@ PLATFORM_PATTERNS = {
 SUPPORTED_PLATFORMS = ["youtube", "facebook", "instagram", "twitter"]
 
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
-
-# Read proxy from environment variable
 PROXY_URL = os.environ.get("PROXY_URL", None)
+
 
 def detect_platform(url: str) -> str:
     url_lower = url.lower()
@@ -41,6 +40,7 @@ def detect_platform(url: str) -> str:
             if re.search(pattern, url_lower):
                 return platform
     return "unknown"
+
 
 def format_duration(seconds) -> str:
     if not seconds:
@@ -53,10 +53,12 @@ def format_duration(seconds) -> str:
         return f"{hours}:{minutes:02d}:{secs:02d}"
     return f"{minutes}:{secs:02d}"
 
+
 def estimate_file_size(tbr, duration):
     if tbr and duration:
         return int((tbr * 1000 / 8) * duration)
     return None
+
 
 def get_quality_label(height) -> str:
     if not height:
@@ -78,6 +80,7 @@ def get_quality_label(height) -> str:
     else:
         return f"{height}p"
 
+
 def extract_video_info(url: str):
     cache_key = hashlib.md5(url.encode()).hexdigest()
     if cache_key in cache:
@@ -86,32 +89,44 @@ def extract_video_info(url: str):
     platform = detect_platform(url)
     use_cookies = platform == "youtube" and os.path.exists(COOKIES_PATH)
 
+    # 🔥 FIXED YDL OPTIONS
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "format": "best/bestvideo+bestaudio",
+
+        # ✅ Better format (audio included)
+        "format": "best[ext=mp4]/best",
+
         "socket_timeout": 30,
-        "extractor_retries": 3,
+        "extractor_retries": 5,
+
+        # 🔥 Fix YouTube blocking
+        "noplaylist": True,
+        "geo_bypass": True,
         "nocheckcertificate": True,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        },
+
+        # 🔥 CRITICAL FIX
         "extractor_args": {
             "youtube": {
-                "player_client": ["web"],
-                "player_skip": ["webpage", "configs"],
+                "player_client": ["android", "web"],
+                "skip": ["dash", "hls"]
             }
         },
+
+        # 🔥 Strong headers (mobile simulation)
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/17.31.35 (Linux; U; Android 11)",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+
+        "retries": 5,
+        "fragment_retries": 5,
     }
 
-    # Add cookies for YouTube
     if use_cookies:
         ydl_opts["cookiefile"] = COOKIES_PATH
 
-    # Add proxy if available
     if PROXY_URL:
         ydl_opts["proxy"] = PROXY_URL
 
@@ -120,6 +135,7 @@ def extract_video_info(url: str):
         result = process_info(info, url)
         cache[cache_key] = result
         return result
+
 
 def process_info(info: dict, original_url: str) -> dict:
     platform = detect_platform(original_url)
@@ -136,9 +152,11 @@ def process_info(info: dict, original_url: str) -> dict:
     seen_keys = set()
     audio_added = False
 
+    # 🔥 FIX: only formats WITH AUDIO
     video_formats = [
         f for f in formats_raw
         if f.get("vcodec") not in [None, "none"]
+        and f.get("acodec") not in [None, "none"]
         and f.get("url")
         and f.get("height")
     ]
@@ -193,47 +211,27 @@ def process_info(info: dict, original_url: str) -> dict:
             "url": download_url,
             "type": "video",
             "recommended": recommended,
-            "has_audio": fmt.get("acodec") not in [None, "none"],
+            "has_audio": True,
         })
 
     if audio_formats and not audio_added:
         best_audio = audio_formats[0]
-        download_url = best_audio.get("url")
-        if download_url:
-            file_size = best_audio.get("filesize") or best_audio.get("filesize_approx")
-            if not file_size:
-                tbr = best_audio.get("tbr") or best_audio.get("abr")
-                file_size = estimate_file_size(tbr, info.get("duration"))
-
-            formats.append({
-                "format_id": best_audio.get("format_id"),
-                "quality": "Audio Only",
-                "ext": "mp3",
-                "resolution": None,
-                "fps": None,
-                "vcodec": None,
-                "acodec": best_audio.get("acodec"),
-                "file_size": file_size,
-                "url": download_url,
-                "type": "audio",
-                "recommended": False,
-                "has_audio": True,
-            })
-            audio_added = True
+        formats.append({
+            "format_id": best_audio.get("format_id"),
+            "quality": "Audio Only",
+            "ext": "mp3",
+            "url": best_audio.get("url"),
+            "type": "audio",
+            "recommended": False,
+            "has_audio": True,
+        })
 
     if not formats:
         best_url = info.get("url")
         if best_url:
-            height = info.get("height")
             formats.append({
                 "format_id": "best",
-                "quality": get_quality_label(height) if height else "Best",
-                "ext": info.get("ext", "mp4"),
-                "resolution": f"{info.get('width', '?')}x{height}" if height else None,
-                "fps": info.get("fps"),
-                "vcodec": info.get("vcodec"),
-                "acodec": info.get("acodec"),
-                "file_size": info.get("filesize") or info.get("filesize_approx"),
+                "quality": "Best",
                 "url": best_url,
                 "type": "video",
                 "recommended": True,
@@ -254,71 +252,30 @@ def process_info(info: dict, original_url: str) -> dict:
         "format_count": len(formats),
     }
 
+
 @app.route("/api/video/info", methods=["POST"])
 def get_video_info():
     data = request.get_json()
-    if not data:
-        return jsonify({"success": False, "error": "Request body must be JSON"}), 400
-
     url = (data.get("url") or "").strip()
+
     if not url:
         return jsonify({"success": False, "error": "URL is required"}), 400
-
-    if not url.startswith(("http://", "https://")):
-        return jsonify({"success": False, "error": "Invalid URL format. URL must start with http:// or https://"}), 400
-
-    platform = detect_platform(url)
-
-    if platform == "unknown":
-        return jsonify({
-            "success": False,
-            "error": "Unsupported platform. Only YouTube, Instagram, Facebook, and Twitter/X are supported."
-        }), 422
 
     try:
-        result = extract_video_info(url)
-        return jsonify(result)
-    except yt_dlp.utils.DownloadError as e:
-        error_msg = str(e)
-        if "Private video" in error_msg or "This video is private" in error_msg:
-            return jsonify({"success": False, "error": "This video is private and cannot be accessed."}), 403
-        elif "not available" in error_msg.lower():
-            return jsonify({"success": False, "error": "Video is not available. It may have been removed or restricted."}), 404
-        elif "Unsupported URL" in error_msg:
-            return jsonify({"success": False, "error": "Unsupported URL. Only YouTube, Instagram, Facebook, and Twitter/X links are accepted."}), 422
-        elif "Sign in" in error_msg or "login" in error_msg.lower():
-            return jsonify({"success": False, "error": "This content requires login and cannot be accessed."}), 403
-        else:
-            return jsonify({"success": False, "error": "Could not extract video information. The video may be unavailable or the URL may be invalid."}), 422
-    except Exception as e:
-        return jsonify({"success": False, "error": "An unexpected error occurred. Please try again."}), 500
+        return jsonify(extract_video_info(url))
 
-@app.route("/api/video/detect-platform", methods=["POST"])
-def detect_platform_endpoint():
-    data = request.get_json()
-    if not data:
-        return jsonify({"success": False, "error": "Request body must be JSON"}), 400
-
-    url = (data.get("url") or "").strip()
-    if not url:
-        return jsonify({"success": False, "error": "URL is required"}), 400
-
-    platform = detect_platform(url)
-    supported = platform in SUPPORTED_PLATFORMS
-
-    if not supported:
+    except yt_dlp.utils.DownloadError:
         return jsonify({
-            "success": True,
-            "platform": platform,
-            "supported": False,
-            "message": "Only YouTube, Instagram, Facebook, and Twitter/X are supported."
-        })
+            "success": False,
+            "error": "Video is restricted/private or blocked. Try another public video."
+        }), 403
 
-    return jsonify({
-        "success": True,
-        "platform": platform,
-        "supported": True,
-    })
+    except Exception:
+        return jsonify({
+            "success": False,
+            "error": "Server error"
+        }), 500
+
 
 @app.route("/api/healthz", methods=["GET"])
 def health():
@@ -328,6 +285,7 @@ def health():
         "supported_platforms": SUPPORTED_PLATFORMS,
         "proxy_enabled": PROXY_URL is not None,
     })
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
