@@ -77,27 +77,29 @@ def extract_video_info(url: str):
 
     ydl_opts = {
         "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
+    "no_warnings": True,
+    "skip_download": True,
 
-        # 🔥 FIXED format (stable + 1080)
-        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-        "noplaylist": True,
-        "geo_bypass": True,
-        "nocheckcertificate": True,
-        "extractor_retries": 5,
-        "retries": 5,
+    "format": "(bestvideo[height<=1080]+bestaudio)/(best[height<=1080])/best",
 
-        # 🔥 IMPORTANT for YouTube
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-            }
-        },
+    "merge_output_format": "mp4",
 
-        "http_headers": {
-            "User-Agent": "com.google.android.youtube/17.31.35 (Linux; U; Android 11)",
-            "Accept-Language": "en-US,en;q=0.9",
+    "noplaylist": True,
+    "geo_bypass": True,
+    "nocheckcertificate": True,
+
+    "extractor_retries": 5,
+    "retries": 5,
+
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["android"],
+        }
+    },
+
+    "http_headers": {
+        "User-Agent": "com.google.android.youtube/17.31.35 (Linux; U; Android 11)",
+        "Accept-Language": "en-US,en;q=0.9",
         },
     }
 
