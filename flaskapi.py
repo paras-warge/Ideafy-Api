@@ -104,7 +104,7 @@ def extract_video_info(url: str):
         "skip_download": True,
 
         # Get ALL formats so we can pick qualities
-        "format": "bestvideo+bestaudio/best",
+        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
 
         "socket_timeout": 30,
         "extractor_retries": 5,
