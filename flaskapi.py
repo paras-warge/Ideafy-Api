@@ -93,7 +93,7 @@ def get_ydl_opts(platform, cookies_path):
         ydl_opts["http_headers"]["User-Agent"] = "com.google.android.youtube/17.31.35 (Linux; U; Android 11)"
         ydl_opts["extractor_args"] = {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": ["android"],
             }
         }
         if cookies_path:
