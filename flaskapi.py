@@ -81,8 +81,7 @@ def extract_video_info(url: str):
         "skip_download": True,
 
         # 🔥 FIXED format (stable + 1080)
-        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-
+        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "noplaylist": True,
         "geo_bypass": True,
         "nocheckcertificate": True,
