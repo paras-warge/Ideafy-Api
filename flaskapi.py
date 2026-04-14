@@ -379,8 +379,11 @@ def health():
         "supported_platforms": SUPPORTED_PLATFORMS,
         "proxy_enabled": PROXY_URL is not None,
         "cookies_loaded": get_cookies_path() is not None,
+        
     })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
     app.run(host="0.0.0.0", port=port, debug=False)
+
+    print("Cookies path:", get_cookies_path())
