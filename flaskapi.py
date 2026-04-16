@@ -70,8 +70,32 @@ def estimate_file_size(tbr, duration):
     return None
 
 
-def get_ydl_opts(platform, cookies_path):
-    ydl_opts = {
+def get_quality_label(height):
+    if not height:
+        return None
+    if height >= 2160:
+        return "4K"
+    elif height >= 1440:
+        return "1440p"
+    elif height >= 1080:
+        return "1080p"
+    elif height >= 720:
+        return "720p"
+    elif height >= 480:
+        return "480p"
+    elif height >= 360:
+        return "360p"
+    elif height >= 240:
+        return "240p"
+    elif height >= 144:
+        return "144p"
+    else:
+        return f"{height}p"
+
+
+def get_ydl_opts_youtube(cookies_path):
+    """YouTube: get all formats including adaptive streams"""
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
@@ -80,29 +104,47 @@ def get_ydl_opts(platform, cookies_path):
         "nocheckcertificate": True,
         "extractor_retries": 5,
         "retries": 5,
+        # Get everything — we filter manually
+        "format": "bestvideo+bestaudio/best",
+        "extractor_args": {
+            "youtube": {
+                # android client bypasses bot check reliably
+                "player_client": ["android", "web"],
+            }
+        },
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "com.google.android.youtube/17.31.35 (Linux; U; Android 11)",
             "Accept-Language": "en-US,en;q=0.9",
         },
     }
-
-    if platform == "youtube":
-        ydl_opts["format"] = "bestvideo+bestaudio/best"
-        ydl_opts["http_headers"]["User-Agent"] = "com.google.android.youtube/17.31.35 (Linux; U; Android 11)"
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["android"],
-            }
-        }
-        if cookies_path:
-            ydl_opts["cookiefile"] = cookies_path
-    else:
-        ydl_opts["format"] = "best/bestvideo+bestaudio"
-
+    if cookies_path:
+        opts["cookiefile"] = cookies_path
     if PROXY_URL:
-        ydl_opts["proxy"] = PROXY_URL
+        opts["proxy"] = PROXY_URL
+    return opts
 
-    return ydl_opts
+
+def get_ydl_opts_social(platform):
+    """Instagram / Facebook / Twitter: get best merged format only"""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "geo_bypass": True,
+        "nocheckcertificate": True,
+        "extractor_retries": 5,
+        "retries": 5,
+        # Prefer progressive (merged) formats directly downloadable on mobile
+        "format": "best[ext=mp4]/best",
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    }
+    if PROXY_URL:
+        opts["proxy"] = PROXY_URL
+    return opts
 
 
 def extract_video_info(url: str):
@@ -112,7 +154,11 @@ def extract_video_info(url: str):
 
     platform = detect_platform(url)
     cookies_path = get_cookies_path()
-    ydl_opts = get_ydl_opts(platform, cookies_path)
+
+    if platform == "youtube":
+        ydl_opts = get_ydl_opts_youtube(cookies_path)
+    else:
+        ydl_opts = get_ydl_opts_social(platform)
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -121,62 +167,71 @@ def extract_video_info(url: str):
         return result
 
 
-def process_info(info, original_url, platform):
-    title = info.get("title") or "Unknown Title"
-    thumbnail = info.get("thumbnail") or ""
-    duration = info.get("duration")
-    uploader = info.get("uploader") or info.get("channel") or ""
-    view_count = info.get("view_count")
-    description = (info.get("description") or "")[:300]
-
-    formats_raw = info.get("formats") or []
+def process_youtube_formats(formats_raw, duration):
+    """
+    YouTube: return full quality range.
+    - Merged formats (have both video+audio): directly downloadable
+    - Video-only formats (1080p+): flagged has_audio=False
+    - Audio-only: one best option
+    """
     formats = []
     seen = set()
     audio_added = False
 
-    merged_formats = [
+    # Separate merged, video-only, audio-only
+    merged = [
         f for f in formats_raw
         if f.get("vcodec") not in [None, "none"]
         and f.get("acodec") not in [None, "none"]
         and f.get("url")
+        and f.get("height")
     ]
 
-    video_only_formats = [
+    video_only = [
         f for f in formats_raw
         if f.get("vcodec") not in [None, "none"]
         and f.get("acodec") in [None, "none"]
         and f.get("url")
+        and f.get("height")
     ]
 
-    audio_formats = [
+    audio_only = [
         f for f in formats_raw
         if f.get("vcodec") in [None, "none"]
         and f.get("acodec") not in [None, "none"]
         and f.get("url")
     ]
 
-    all_video = merged_formats + video_only_formats
+    # Combine and sort
+    all_video = merged + video_only
     all_video.sort(
-        key=lambda f: (f.get("height") or 0, f.get("fps", 0) or 0),
+        key=lambda f: (f.get("height", 0), f.get("fps", 0) or 0),
         reverse=True
     )
-    audio_formats.sort(key=lambda f: f.get("tbr", 0) or 0, reverse=True)
+    audio_only.sort(key=lambda f: f.get("tbr", 0) or 0, reverse=True)
 
     for fmt in all_video:
-        height = fmt.get("height") or "?"
+        height = fmt.get("height")
+        if not height:
+            continue
+
         fps = fmt.get("fps") or 0
-        ext = fmt.get("ext") or "mp4"
         is_60fps = fps >= 50
+        dynamic_range = (fmt.get("dynamic_range") or "").lower()
+        is_hdr = "hdr" in dynamic_range
 
-        dynamic_range = fmt.get("dynamic_range") or ""
-        is_hdr = "hdr" in dynamic_range.lower() if dynamic_range else False
+        quality_label = get_quality_label(height)
+        if not quality_label:
+            continue
 
-        quality_label = f"{height}p" if height != "?" else "video"
+        # Build display label
+        display = quality_label
         if is_60fps:
-            quality_label += " 60fps"
+            display += " 60fps"
         if is_hdr:
-            quality_label += " HDR"
+            display += " HDR"
 
+        # Deduplicate
         key = f"{height}_{'60' if is_60fps else '30'}_{'hdr' if is_hdr else 'sdr'}"
         if key in seen:
             continue
@@ -186,6 +241,8 @@ def process_info(info, original_url, platform):
         if not download_url:
             continue
 
+        has_audio = fmt.get("acodec") not in [None, "none"]
+
         tbr = fmt.get("tbr") or fmt.get("vbr")
         file_size = estimate_file_size(tbr, duration)
         if fmt.get("filesize"):
@@ -193,34 +250,31 @@ def process_info(info, original_url, platform):
         elif fmt.get("filesize_approx"):
             file_size = fmt.get("filesize_approx")
 
-        recommended = height == 720 and not is_60fps and not is_hdr
-
         formats.append({
             "format_id": fmt.get("format_id"),
-            "quality": quality_label,
-            "ext": ext if ext != "none" else "mp4",
-            "resolution": f"{fmt.get('width', '?')}x{height}" if height != "?" else None,
+            "quality": display,
+            "ext": fmt.get("ext") or "mp4",
+            "resolution": f"{fmt.get('width', '?')}x{height}",
             "fps": fps,
             "is_60fps": is_60fps,
             "is_hdr": is_hdr,
             "file_size": file_size,
             "url": download_url,
             "type": "video",
-            "recommended": recommended,
-            "has_audio": fmt.get("acodec") not in [None, "none"],
+            "recommended": quality_label == "720p" and not is_60fps and not is_hdr,
+            "has_audio": has_audio,
         })
 
-    if audio_formats and not audio_added:
-        best_audio = audio_formats[0]
-        download_url = best_audio.get("url")
-        if download_url:
-            file_size = best_audio.get("filesize") or best_audio.get("filesize_approx")
+    # Best audio only
+    if audio_only and not audio_added:
+        best = audio_only[0]
+        dl_url = best.get("url")
+        if dl_url:
+            file_size = best.get("filesize") or best.get("filesize_approx")
             if not file_size:
-                tbr = best_audio.get("tbr") or best_audio.get("abr")
-                file_size = estimate_file_size(tbr, duration)
-
+                file_size = estimate_file_size(best.get("tbr") or best.get("abr"), duration)
             formats.append({
-                "format_id": best_audio.get("format_id"),
+                "format_id": best.get("format_id"),
                 "quality": "Audio Only",
                 "ext": "mp3",
                 "resolution": None,
@@ -228,31 +282,165 @@ def process_info(info, original_url, platform):
                 "is_60fps": False,
                 "is_hdr": False,
                 "file_size": file_size,
-                "url": download_url,
+                "url": dl_url,
                 "type": "audio",
                 "recommended": False,
                 "has_audio": True,
             })
             audio_added = True
 
+    return formats
+
+
+def process_social_formats(formats_raw, duration):
+    """
+    Instagram / Facebook / Twitter:
+    - Return ONLY best merged (video+audio) format
+    - Plus audio only option
+    Mobile needs direct downloadable single-file formats only.
+    """
+    formats = []
+    audio_added = False
+
+    # Only merged formats (have both video and audio)
+    merged = [
+        f for f in formats_raw
+        if f.get("vcodec") not in [None, "none"]
+        and f.get("acodec") not in [None, "none"]
+        and f.get("url")
+    ]
+
+    # Audio only formats
+    audio_only = [
+        f for f in formats_raw
+        if f.get("vcodec") in [None, "none"]
+        and f.get("acodec") not in [None, "none"]
+        and f.get("url")
+    ]
+
+    # Sort merged by quality
+    merged.sort(
+        key=lambda f: (f.get("height") or 0, f.get("tbr") or 0),
+        reverse=True
+    )
+    audio_only.sort(key=lambda f: f.get("tbr", 0) or 0, reverse=True)
+
+    seen_heights = set()
+
+    for fmt in merged:
+        height = fmt.get("height")
+        dl_url = fmt.get("url") or fmt.get("manifest_url")
+        if not dl_url:
+            continue
+
+        quality_label = get_quality_label(height) if height else "Best"
+        key = str(height or "best")
+        if key in seen_heights:
+            continue
+        seen_heights.add(key)
+
+        file_size = fmt.get("filesize") or fmt.get("filesize_approx")
+        if not file_size:
+            file_size = estimate_file_size(fmt.get("tbr"), duration)
+
+        formats.append({
+            "format_id": fmt.get("format_id"),
+            "quality": quality_label,
+            "ext": fmt.get("ext") or "mp4",
+            "resolution": f"{fmt.get('width', '?')}x{height}" if height else None,
+            "fps": fmt.get("fps") or 0,
+            "is_60fps": (fmt.get("fps") or 0) >= 50,
+            "is_hdr": False,
+            "file_size": file_size,
+            "url": dl_url,
+            "type": "video",
+            "recommended": True if not seen_heights - {key} else False,
+            "has_audio": True,
+        })
+
+    # Fallback: if no merged found use best available
     if not formats:
-        best_url = info.get("url")
-        if best_url:
-            height = info.get("height")
+        best_url = None
+        for f in formats_raw:
+            if f.get("url"):
+                best_url = f.get("url")
+                height = f.get("height")
+                file_size = f.get("filesize") or f.get("filesize_approx")
+                formats.append({
+                    "format_id": f.get("format_id"),
+                    "quality": get_quality_label(height) if height else "Best",
+                    "ext": f.get("ext") or "mp4",
+                    "resolution": f"{f.get('width', '?')}x{height}" if height else None,
+                    "fps": f.get("fps") or 0,
+                    "is_60fps": False,
+                    "is_hdr": False,
+                    "file_size": file_size,
+                    "url": best_url,
+                    "type": "video",
+                    "recommended": True,
+                    "has_audio": True,
+                })
+                break
+
+    # Audio only
+    if audio_only and not audio_added:
+        best = audio_only[0]
+        dl_url = best.get("url")
+        if dl_url:
+            file_size = best.get("filesize") or best.get("filesize_approx")
+            if not file_size:
+                file_size = estimate_file_size(best.get("tbr") or best.get("abr"), duration)
             formats.append({
-                "format_id": "best",
-                "quality": f"{height}p" if height else "Best",
-                "ext": info.get("ext", "mp4"),
-                "resolution": f"{info.get('width', '?')}x{height}" if height else None,
-                "fps": info.get("fps"),
+                "format_id": best.get("format_id"),
+                "quality": "Audio Only",
+                "ext": "mp3",
+                "resolution": None,
+                "fps": None,
                 "is_60fps": False,
                 "is_hdr": False,
-                "file_size": info.get("filesize") or info.get("filesize_approx"),
-                "url": best_url,
-                "type": "video",
-                "recommended": True,
+                "file_size": file_size,
+                "url": dl_url,
+                "type": "audio",
+                "recommended": False,
                 "has_audio": True,
             })
+            audio_added = True
+
+    return formats
+
+
+def process_info(info, original_url, platform):
+    title = info.get("title") or "Unknown Title"
+    thumbnail = info.get("thumbnail") or ""
+    duration = info.get("duration")
+    uploader = info.get("uploader") or info.get("channel") or ""
+    view_count = info.get("view_count")
+    description = (info.get("description") or "")[:300]
+    formats_raw = info.get("formats") or []
+
+    # Use platform-specific format processing
+    if platform == "youtube":
+        formats = process_youtube_formats(formats_raw, duration)
+    else:
+        formats = process_social_formats(formats_raw, duration)
+
+    # Final fallback if still empty
+    if not formats and info.get("url"):
+        height = info.get("height")
+        formats.append({
+            "format_id": "best",
+            "quality": get_quality_label(height) if height else "Best",
+            "ext": info.get("ext") or "mp4",
+            "resolution": f"{info.get('width', '?')}x{height}" if height else None,
+            "fps": info.get("fps") or 0,
+            "is_60fps": False,
+            "is_hdr": False,
+            "file_size": info.get("filesize") or info.get("filesize_approx"),
+            "url": info.get("url"),
+            "type": "video",
+            "recommended": True,
+            "has_audio": True,
+        })
 
     return {
         "success": True,
