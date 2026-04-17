@@ -38,12 +38,55 @@ PROXY_URL = os.environ.get("PROXY_URL", None)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def clean_url(url: str) -> str:
-    """Normalise URL — expand youtu.be shortlinks, strip tracking params."""
+    """
+    Normalise URL:
+    - Expand youtu.be shortlinks
+    - Strip ALL query params from Instagram/Facebook/Twitter
+      (utm_source, igsh, fbclid etc. are tracking noise — yt-dlp only needs the path)
+    - For YouTube keep only the v= param (strip &list=, &pp=, etc.)
+    """
+    from urllib.parse import urlparse, parse_qs, urlunparse
+
+    url = url.strip()
+
+    # youtu.be shortlink → full watch URL
     if "youtu.be" in url:
         video_id = url.split("/")[-1].split("?")[0]
         return f"https://www.youtube.com/watch?v={video_id}"
-    # Keep only the first query param chunk (removes &list=, &pp=, etc.)
+
+    try:
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+
+        # YouTube: keep only the v= param
+        if "youtube.com" in host:
+            params = parse_qs(parsed.query)
+            v = params.get("v", [None])[0]
+            new_query = f"v={v}" if v else ""
+            return urlunparse(parsed._replace(query=new_query))
+
+        # Social platforms: strip ALL query params — path is enough for yt-dlp
+        if any(x in host for x in (
+            "instagram.com", "facebook.com", "fb.watch", "twitter.com", "x.com"
+        )):
+            return urlunparse(parsed._replace(query="", fragment=""))
+
+    except Exception:
+        pass  # fall through to simple fallback
+
+    # Generic fallback: strip from & onward
     return url.split("&")[0]
+
+
+def detect_platform(url: str) -> str:
+    """Detect platform — URL-decode first so %2F etc. don't break regex matching."""
+    from urllib.parse import unquote
+    url_lower = unquote(url).lower()
+    for platform, patterns in PLATFORM_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, url_lower):
+                return platform
+    return "unknown"
 
 
 def get_cookies_path():
@@ -59,15 +102,6 @@ def get_cookies_path():
         return tmp.name
     log.warning("No cookies found — YouTube bot-check may trigger")
     return None
-
-
-def detect_platform(url: str) -> str:
-    url_lower = url.lower()
-    for platform, patterns in PLATFORM_PATTERNS.items():
-        for pattern in patterns:
-            if re.search(pattern, url_lower):
-                return platform
-    return "unknown"
 
 
 def format_duration(seconds) -> str | None:
@@ -645,19 +679,45 @@ def get_video_info():
 
     except yt_dlp.utils.DownloadError as e:
         msg = str(e)
-        log.error("yt-dlp DownloadError: %s", msg)
+        log.error("yt-dlp DownloadError [%s]: %s", platform, msg)
+
         if "Private video" in msg or "This video is private" in msg:
             return jsonify({"success": False, "error": "This video is private."}), 403
-        if "Sign in" in msg or "bot" in msg.lower() or "login" in msg.lower():
-            return jsonify({
-                "success": False,
-                "error": "YouTube requires sign-in verification. Please add fresh cookies.",
-            }), 403
+
         if "not available" in msg.lower() or "removed" in msg.lower():
             return jsonify({"success": False, "error": "Video unavailable or removed."}), 404
+
         if "Requested format is not available" in msg:
-            return jsonify({"success": False, "error": "Requested format not available. Try a different quality."}), 422
-        return jsonify({"success": False, "error": "Could not extract video info."}), 422
+            return jsonify({"success": False, "error": "No downloadable format found."}), 422
+
+        # Login/bot errors — message is platform-specific
+        if "Sign in" in msg or "bot" in msg.lower() or "login" in msg.lower():
+            if platform == "youtube":
+                return jsonify({
+                    "success": False,
+                    "error": "YouTube requires sign-in verification. Please add fresh cookies.",
+                }), 403
+            elif platform == "instagram":
+                return jsonify({
+                    "success": False,
+                    "error": "This Instagram content requires login or is not publicly accessible.",
+                }), 403
+            elif platform == "facebook":
+                return jsonify({
+                    "success": False,
+                    "error": "This Facebook video requires login or is not publicly accessible.",
+                }), 403
+            else:
+                return jsonify({
+                    "success": False,
+                    "error": "This content requires login or is not publicly accessible.",
+                }), 403
+
+        # Generic fallback — include platform name so it's actually useful
+        return jsonify({
+            "success": False,
+            "error": f"Could not extract video info from {platform}. The content may be private or unavailable.",
+        }), 422
 
     except Exception as e:
         log.exception("Unexpected error: %s", e)
