@@ -3,6 +3,8 @@ import re
 import hashlib
 import tempfile
 import logging
+import subprocess
+import json as _json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import yt_dlp
@@ -111,17 +113,11 @@ def pick_filesize(fmt, duration) -> int | None:
 # yt-dlp option builders
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Chrome-like UA for most sites
+# Browser UA — used for YouTube (tv_embedded client) and social platforms
 _DESKTOP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# Android YouTube app UA — best for bypassing bot checks
-_ANDROID_YT_UA = (
-    "com.google.android.youtube/19.09.37 (Linux; U; Android 14; "
-    "Pixel 8 Build/AP1A.240405.002) gzip"
 )
 
 
@@ -143,39 +139,97 @@ def _base_opts() -> dict:
     return opts
 
 
-def get_ydl_opts_youtube(cookies_path) -> dict:
+def get_po_token() -> tuple[str | None, str | None]:
     """
-    YouTube extraction options.
+    Generate a YouTube po_token + visitor_data pair using the
+    yt-dlp-get-pot plugin helper (node package: @yt-dlp/get-pot).
 
-    KEY CHANGES vs original:
-    1. Use `format="bestvideo*+bestaudio/best"` so yt-dlp fetches ALL formats in
-       the info dict (not just the selected one).  We parse info["formats"] ourselves.
-    2. player_client list extended: ios added — iOS client reliably bypasses bot
-       checks even without cookies.  Order matters: android first, ios fallback.
-    3. Added `youtube_include_dash_manifest: False` to avoid DASH-only entries
-       that lack direct URLs.
-    4. extractor_args po_token / visitor_data left out — handled by cookies.
+    Returns (po_token, visitor_data) or (None, None) if unavailable.
+    po_token is needed on datacenter IPs (Railway, Render, etc.) to
+    bypass YouTube's Proof-of-Origin bot check introduced in late 2023.
+
+    To enable this, install on your server:
+        npm install -g @yt-dlp/get-pot
+    Or add to your Dockerfile / Railway build command.
+    If not installed this silently returns None and we fall back to
+    client-rotation strategy.
     """
+    po_token = os.environ.get("YT_PO_TOKEN")
+    visitor_data = os.environ.get("YT_VISITOR_DATA")
+    if po_token and visitor_data:
+        log.info("Using po_token from environment variable")
+        return po_token, visitor_data
+
+    # Try generating dynamically via the npm helper
+    try:
+        result = subprocess.run(
+            ["npx", "--yes", "@yt-dlp/get-pot", "--output-json"],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0:
+            data = _json.loads(result.stdout.strip())
+            pot = data.get("po_token") or data.get("poToken")
+            vd = data.get("visitor_data") or data.get("visitorData")
+            if pot and vd:
+                log.info("po_token generated dynamically via @yt-dlp/get-pot")
+                return pot, vd
+    except Exception as e:
+        log.warning("Could not generate po_token dynamically: %s", e)
+
+    return None, None
+
+
+# YouTube client rotation order:
+# 1. tv_embedded  — TV client, no bot check, no cookies required
+# 2. ios          — Mobile client, very reliable
+# 3. android      — Android app, good fallback
+# 4. mweb         — Mobile web, last resort
+_YT_CLIENT_ROTATION = [
+    ["tv_embedded"],
+    ["ios"],
+    ["android"],
+    ["mweb"],
+]
+
+
+def get_ydl_opts_youtube(cookies_path, client_list=None, po_token=None, visitor_data=None) -> dict:
+    """
+    YouTube extraction options with full bot-bypass stack:
+
+    1. tv_embedded client — bypasses ALL bot checks, no cookies needed.
+       YouTube's TV client (used by smart TVs) is never challenged.
+    2. po_token support  — for datacenter IPs where even tv_embedded fails.
+    3. Cookie support    — for age-restricted or member-only content.
+    4. No DASH manifests — avoids URL-less format entries on server deployments.
+    """
+    if client_list is None:
+        client_list = _YT_CLIENT_ROTATION[0]  # tv_embedded by default
+
     opts = _base_opts()
     opts.update({
-        # Fetch everything; we'll filter manually
         "format": "bestvideo*+bestaudio/best",
         "http_headers": {
-            "User-Agent": _ANDROID_YT_UA,
+            # Generic browser UA — tv_embedded doesn't need the Android app UA
+            "User-Agent": _DESKTOP_UA,
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         },
         "extractor_args": {
             "youtube": {
-                # android avoids bot check; ios as secondary fallback
-                "player_client": ["android", "ios", "web"],
-                # Skip DASH manifests — they produce URL-less entries on some servers
+                "player_client": client_list,
                 "youtube_include_dash_manifest": [False],
             }
         },
     })
+
+    # Inject po_token if available
+    if po_token and visitor_data:
+        opts["extractor_args"]["youtube"]["po_token"] = [f"web+{po_token}"]
+        opts["extractor_args"]["youtube"]["visitor_data"] = [visitor_data]
+        log.info("po_token injected into yt-dlp options")
+
     if cookies_path:
         opts["cookiefile"] = cookies_path
+
     return opts
 
 
@@ -504,22 +558,61 @@ def extract_video_info(url: str) -> dict:
         return cache[cache_key]
 
     platform = detect_platform(url)
+
+    if platform != "youtube":
+        ydl_opts = get_ydl_opts_social(platform)
+        log.info("Extracting info for %s (platform=%s)", url, platform)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        result = process_info(info, platform)
+        cache[cache_key] = result
+        return result
+
+    # ── YouTube: multi-client retry loop ─────────────────────────────────────
+    # Try each client in rotation.  On datacenter IPs the first client that
+    # works without a bot error wins.  tv_embedded almost always works without
+    # cookies; ios/android are reliable secondaries.
     cookies_path = get_cookies_path()
+    po_token, visitor_data = get_po_token()
+    last_error = None
 
-    ydl_opts = (
-        get_ydl_opts_youtube(cookies_path)
-        if platform == "youtube"
-        else get_ydl_opts_social(platform)
-    )
+    for attempt, client_list in enumerate(_YT_CLIENT_ROTATION, 1):
+        log.info(
+            "YouTube attempt %d/%d — client=%s po_token=%s",
+            attempt, len(_YT_CLIENT_ROTATION),
+            client_list, bool(po_token)
+        )
+        ydl_opts = get_ydl_opts_youtube(
+            cookies_path,
+            client_list=client_list,
+            po_token=po_token,
+            visitor_data=visitor_data,
+        )
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            result = process_info(info, platform)
+            cache[cache_key] = result
+            log.info("YouTube extraction succeeded on attempt %d (client=%s)", attempt, client_list)
+            return result
+        except yt_dlp.utils.DownloadError as e:
+            msg = str(e)
+            last_error = e
+            bot_error = (
+                "Sign in" in msg
+                or "bot" in msg.lower()
+                or "confirm your age" in msg.lower()
+                or "This video is unavailable" in msg
+            )
+            if bot_error:
+                log.warning("Bot/sign-in error with client=%s, trying next client", client_list)
+                continue  # try next client
+            # Non-bot error (private video, removed, etc.) — raise immediately
+            raise
 
-    log.info("Extracting info for %s (platform=%s)", url, platform)
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    result = process_info(info, platform)
-    cache[cache_key] = result
-    return result
+    # All clients exhausted
+    log.error("All YouTube clients failed. Last error: %s", last_error)
+    raise last_error
 
 
 # ─────────────────────────────────────────────────────────────────────────────
